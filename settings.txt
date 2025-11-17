@@ -1,0 +1,34 @@
+#!/bin/bash
+# This script sets the parameters and directories for RNA-seq analysis.
+
+# General setup
+main_folder="/Users/flaviogabrieli/prova"  # Path to the main project folder
+threads=8         # Number of threads to use for processing
+pe=true #change to false if your sequencing is single-end
+
+# Trimming
+trimming=true #change to false if you want to skip trimming
+path_to_trimmomatic=/Users/flaviogabrieli/bin/Trimmomatic/trimmomatic-0.39.jar #set the path to trimmomatic if not installed 
+
+sliding_window="SLIDINGWINDOW:4:20" #specifies the number of bases to average across and the average quality required. (e.g. SLIDINGWINDOW:4:20)
+leading="LEADING:30" #Specifies the minimum quality required to keep a base. (e.g. LEADING:30)
+trailing="TRAILING:30" #Specifies the minimum quality required to keep a base. (e.g. TRAILING:30)
+crop="" #Specifies the number of bases to keep, from the start of the read. (e.g. CROP:135)
+headcrop="" #Specifies the number of bases to remove from the start of the read. (e.g. HEADCROP:15)
+
+adapters_file="" #path to the fasta file containing the adapters sequences
+seed_mismatches="" #specifies the maximum mismatch count which will still allow a full match to be performed
+palindrome_clip_threshold="" #specifies how accurate the match between the two 'adapter ligated' reads must be for PE palindrome read alignment.
+simple_clip_threshold="" #pecifies how accurate the match between any adapter etc. sequence must be against a read.
+
+# Alignment
+path_to_indexed_reference_genome="false" #set false if you need to compute the reference genome index for STAR
+
+path_to_genome_annotation="" #this is used both by STAR to generate the index and by featureCounts
+path_to_genome_sequence="" #this is used only if STAR genome index is not already availale; it is ignored if path_to_indexed_reference_genome is specified.
+sjdbOverhang=149 #Ideally, this length should be equal to the ReadLength-1, where ReadLength is the length of the reads. For instance, for Illumina 2x100b paired-end reads, the ideal value is 100-1=99. In case of reads of varying length, the ideal value is max(ReadLength)-1. It is ignored if path_to_indexed_reference_genome is specified.
+
+#For small genomes, the parameter --genomeSAindexNbases must to be scaled down, with a typical
+#value of min(14, log2(GenomeLength)/2 - 1). For example, for 1 megaBase genome, this is equal
+#to 9, for 100 kiloBase genome, this is equal to 7. It is ignored if path_to_indexed_reference_genome is specified.
+SAindexNbases="12" 

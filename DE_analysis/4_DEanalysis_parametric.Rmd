@@ -1,0 +1,575 @@
+---
+title: "Differential expression analysis of RNA-seq data"
+author: "Flavio Gabrieli"
+#date: "2025-05-07"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(ggrepel)
+library(HTSFilter)
+library(edgeR)
+library(pheatmap)
+library(openxlsx)
+library(org.At.tair.db)
+library(dplyr)
+library(knitr)
+library(enrichplot)
+library(clusterProfiler)
+library(GO.db)
+library(stringr)
+library(AnnotationDbi)
+```
+
+```{r loading analysis parameters}
+source("RNA-seq_analysis/DE_parameters.R")
+
+```
+
+```{r loadig raw counts, echo=FALSE, include=FALSE}
+counts <- read.delim(file=count_matrix_file,sep="\t",header=T,row.names=1)
+head(counts)
+```
+```{r loading sample metadata, echo=FALSE, results = 'asis'}
+#import sample names
+samples <- read.delim(file = samples_file)
+
+#format samples table
+samples$gen <- as.factor(substr(samples$Client_ID,1,1))
+samples$stage <- as.factor(substr(samples$Client_ID,2,2))
+samples$cond <- as.factor(substr(samples$Client_ID,1,2))
+samples$Sample_name <- str_replace_all(samples$Sample_name,"-",".")
+```
+```{r selecting samples, include=FALSE}
+samples = samples[samples$Client_ID %in% keep_samples,]
+#samples <- samples[match(colnames(counts), samples$Sample_Name), ]
+counts = counts[, colnames(counts) %in% samples$Sample_name]
+counts = counts[,match(colnames(counts), samples$Sample_name)]
+```
+```{r showing samples included}
+samples <- samples[match(colnames(counts), samples$Sample_name), ]
+kable(samples)
+```
+
+# Filter out low expressed genes
+
+by HTSfilter Version:	1.31.1
+
+```{r HTS filter, echo=FALSE}
+################ HTS filter
+
+filter = HTSFilter(counts, conds=samples$cond, normalization="TMM")
+
+#Extract the filtered counts and then normalize them
+filtered_counts = as.data.frame(filter$filteredData)
+filtered_tmm = normalizeData(filtered_counts,"TMM")
+#str(filtered_tmm)
+filter_tmm_dataframe = as.data.frame(filtered_tmm$data.norm)
+#head(filter_tmm_dataframe)
+```
+
+```{r PCA stats, echo=FALSE}
+#PCA####
+s = samples[samples$cond %in% test,]
+pca = prcomp(t(filter_tmm_dataframe)[s$Sample_name,])
+summary_pca <- summary(pca)
+kable(summary_pca$importance)
+```
+
+```{r PCA plot, echo=FALSE}
+#Generate a plot of the pca
+pca_coordinates = as.data.frame(pca$x)
+
+pca_plot = ggplot(data=pca_coordinates,aes(x=PC1,y=PC2,col=s$cond)) + 
+  geom_point() + 
+  xlab(paste0("PC1 ",round(summary_pca$importance[2]*100, digits = 2), "%")) + 
+  ylab(paste0("PC2 ",round(summary_pca$importance[5]*100, digits = 2), "%")) + 
+  geom_text_repel(aes(label = s$Client_ID)) +
+  labs(col = "Experimental group:")
+
+pca_plot
+#ggsave("PCA_HTSfilter_tmm_3DAP.jpg", pca_plot)
+```
+\
+```{r save filtered counts, include=FALSE}
+if(save.tables == T){
+  write.table(filtered_counts, paste0(output_directory,"/filtered_counts_3reps.txt"), quote = F, row.names = T)
+}
+```
+
+# edgeR \
+Here we use edgeR for differential expression analysis \
+
+```{r edgeR model fitting, echo=FALSE}
+#edgeR####
+design = with(samples,model.matrix(~0+cond))
+#design
+
+#Create contrast matrix
+contrasts = makeContrasts(C3_W3 = paste0("cond",test[1],"-cond",test[2]),
+                          levels=design)
+#contrasts
+
+#Create edgeR object
+analysis = DGEList(filtered_counts)
+#analysis
+
+#Normalize the data
+analysis = calcNormFactors(analysis,"TMM")
+#analysis
+
+#Estimate dispersion
+analysis = estimateDisp(analysis,design)
+#analysis
+
+#Model fitting
+fit = glmFit(analysis,design)
+#fit
+```
+
+## `r test[1]` vs. `r test[2]` \
+```{r edgeR LRT test, echo=FALSE}
+#Likelihood ratio tests
+
+#clf vs WT
+lrt_clf_vs_WT = glmLRT(fit,contrast = contrasts[,paste0("cond",test[1],"-cond",test[2])])
+#lrt_clf_vs_WT
+
+#Export results
+results = topTags(lrt_clf_vs_WT,n=Inf)
+#str(results)
+
+results_df = as.data.frame(results)
+#head(results_df)
+```
+### number of differentially expressed genes (DEGs) \
+
+```{r number of DEGs, echo=FALSE, results='asis'}
+#report general info
+#results_df[results_df$logFC > lFC_threshold | results_df$logFC < -lFC_threshold & results_df$FDR<FDR_threshold,]
+
+n_DEGs = nrow(results_df[(results_df$logFC > lFC_threshold_edgeR | results_df$logFC < -lFC_threshold_edgeR) & results_df$FDR<FDR_threshold_edgeR,])
+n_DOWN = nrow(results_df[results_df$logFC < -lFC_threshold_edgeR & results_df$FDR<FDR_threshold_edgeR,])
+n_UP = nrow(results_df[results_df$logFC > lFC_threshold_edgeR & results_df$FDR<FDR_threshold_edgeR,])
+```
+
+number of DEGs (logFC>`r lFC_threshold_edgeR` or logFC<-`r lFC_threshold_edgeR`, FDR<`r FDR_threshold_edgeR`): \
+**`r n_DEGs`**\
+\
+number of down-regulated genes (logFC<-`r lFC_threshold_edgeR`, FDR<`r FDR_threshold_edgeR`): \
+**`r n_DOWN`**\
+\
+number of up-regulated genes (logFC>`r lFC_threshold_edgeR`, FDR<`r FDR_threshold_edgeR`): \
+**`r n_UP`** \
+\
+
+```{r annotate DEGs edgeR, echo=FALSE, include=FALSE}
+#import and format genes IDs, codes and descriptions
+
+if (exists("annotation_file") && file.exists(annotation_file)){
+  
+  unique_annot <- read.delim(annotation_file, na.strings = "")
+  unique_annot <- rename(unique_annot, "Gene_ID" = "LocusID")
+  unique_annot$GeneName <- coalesce(unique_annot$GeneName ,unique_annot$Gene_ID)
+  
+} else {
+  # Get all gene-symbols mappings
+all_annot <- AnnotationDbi::select(
+  org.At.tair.db,
+  keys = rownames(results_df),
+  columns = c("SYMBOL", "GENENAME"),
+  keytype = "TAIR"
+)
+
+# Make sure it's a tibble (dplyr-friendly)
+all_annot <- as_tibble(all_annot)
+
+# Pick one row per TAIR ID (e.g., first one)
+unique_annot <- all_annot %>%
+  group_by(TAIR) %>%
+  slice_head(n = 1) %>%  # use slice_head instead of slice to avoid Rle issues
+  ungroup()
+
+# use AGI code where SYMBOL is not available
+unique_annot$SYMBOL = coalesce(unique_annot$SYMBOL ,unique_annot$TAIR)
+unique_annot <- rename(unique_annot, "Gene_ID" = "TAIR")
+}
+
+```
+
+```{r save tables, echo=FALSE}
+#add gene names
+results_df = as.data.frame(results)
+results_df$Gene_ID <- rownames(results_df)
+results_df <- results_df %>% left_join(unique_annot)
+
+#reorder columns
+results_df <- results_df %>% relocate(where(is.numeric), .after = where(is.character))
+
+# Set a boolean column for significance
+results_df$significant <- ifelse(results_df$FDR < FDR_threshold_edgeR, "Significant", NA)
+# add a column of NOs for differential expression
+results_df$diffexpressed <- "NO"
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+results_df$diffexpressed[results_df$logFC > lFC_threshold_edgeR & results_df$significant == "Significant"] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+results_df$diffexpressed[results_df$logFC < -lFC_threshold_edgeR & results_df$significant == "Significant"] <- "DOWN"
+
+#write the complete table
+if (save.tables == T){
+  write.table(results_df, paste0(output_directory,"/edgeR_",test_name,".txt"), sep = "\t", quote = F, row.names = FALSE)
+}
+```
+
+Top 20 Up-regulated genes: \
+```{r top20 UP genes, echo=FALSE}
+up=results_df[results_df$diffexpressed == "UP",]
+kable(head(up[order(up$logFC, decreasing = TRUE),], 20))
+rm(up)
+```
+
+Top 20 Down-regulated genes: \
+```{r top20 DOWN genes, echo=FALSE}
+down=results_df[results_df$diffexpressed == "DOWN",]
+kable(head(down[order(down$logFC),], 20))
+rm(down)
+```
+
+Volcano Plot \
+```{r volcano plot 1 edgeR, echo=FALSE, warning=FALSE}
+#create a df for the plot data
+plot_data <- results_df
+
+# ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors = c("blue", "red", "black")
+names(mycolors) = c("DOWN", "UP", "NO")
+
+# Create a new column "delabel" to results df; that will contain the name of genes differentially expressed (NA in case they are not)
+plot_data$delabel <- NA
+plot_data$delabel[plot_data$diffexpressed != "NO"] <- plot_data$Gene_ID[plot_data$diffexpressed != "NO"]
+```
+```{r volcano plot 2 edgeR, echo=FALSE, warning=FALSE}
+# volcano plot
+ggplot(data=plot_data, aes(x=logFC, y=-log10(FDR), col=diffexpressed, label=delabel)) +
+  geom_point() + 
+  theme_minimal() +
+  geom_text_repel(max.overlaps = 25) +
+  scale_color_manual(values=mycolors) +
+  geom_vline(xintercept=c(-lFC_threshold_edgeR, lFC_threshold_edgeR), col="red") +
+  geom_hline(yintercept=-log10(FDR_threshold_edgeR), col="red")
+```
+
+MA plot \
+```{r MA plot edgeR, echo=FALSE, warning=FALSE}
+# MA plot
+ggplot(data=plot_data,aes(x=logCPM,y=logFC, col=diffexpressed, label=delabel)) + 
+  geom_point() +
+  theme_minimal() +
+  geom_text_repel(max.overlaps = 20) +
+  scale_color_manual(values=mycolors)
+```
+\
+
+### GO enrichment \
+#### `r test[1]` vs `r test[2]` up-regulated genes \
+```{r GO enrichment UP edgeR, echo=FALSE, fig.height=8, fig.width=6}
+gene_list = as.vector(results_df[results_df$diffexpressed == "UP", "Gene_ID"])
+universe = as.vector(results_df$Gene_ID)
+
+# Perform GO enrichment analysis
+go_enrichment <- enrichGO(
+  gene = gene_list,
+  OrgDb = org.At.tair.db,
+  keyType = keyType,
+  ont = ont,    
+  pAdjustMethod = pAdjustMethod,
+  universe = universe,
+  pvalueCutoff = pvalueCutoff,
+  qvalueCutoff = qvalueCutoff,
+  readable = TRUE       # Convert gene IDs to gene names
+)
+
+if (is.null(go_enrichment) || nrow(as.data.frame(go_enrichment)) == 0) {
+  message("No enrichment results.")
+} else {
+  #calculate pairwise similarity between terms
+go_enrichment_sim = clusterProfiler::simplify(x = go_enrichment,
+                                              cutoff = simCutoff,
+                                              by = simBy,
+                                              select_fun = min,
+                                              measure = simMeasure,
+                                              semData = simSemData)
+#str(go_enrichment_sim)
+
+# Visualization - Dotplot
+dp = dotplot(go_enrichment_sim, showCategory = 20, title = paste0(test[1],"-",test[2],"up-regulated genes"))
+
+# Visualization - Barplot
+bp = barplot(go_enrichment_sim, showCategory = 20, title = paste0(test[1],"-",test[2],"up-regulated genes"))
+
+# Visualization - category-gene-network plot
+np = cnetplot(go_enrichment_sim, showCategory = 5, title = paste0(test[1],"-",test[2],"up-regulated genes"))
+
+print(dp)
+print(bp)
+#print(np)
+  
+}
+```
+\
+#### `r test[1]` vs `r test[2]` down-regulated genes \
+```{r GO enrichment DOWN edgeR, echo=FALSE, fig.height=8, fig.width=6}
+gene_list = results_df[results_df$diffexpressed == "DOWN", "Gene_ID"]
+universe = results_df$Gene_ID
+
+# Perform GO enrichment analysis
+go_enrichment <- enrichGO(
+  gene = gene_list,
+  OrgDb = org.At.tair.db,
+  keyType = keyType,
+  ont = ont,    
+  pAdjustMethod = pAdjustMethod,
+  universe = universe,
+  pvalueCutoff = pvalueCutoff,
+  qvalueCutoff = qvalueCutoff,
+  readable = FALSE       # Convert gene IDs to gene names
+)
+
+if (is.null(go_enrichment) || nrow(as.data.frame(go_enrichment)) == 0) {
+  message("No enrichment results to simplify.")
+} else {
+  #str(go_enrichment)
+
+#calculate pairwise similarity between terms
+go_enrichment_sim = clusterProfiler::simplify(x = go_enrichment,
+                                              cutoff = simCutoff,
+                                              by = simBy,
+                                              select_fun = min,
+                                              measure = simMeasure,
+                                              semData = simSemData)
+#str(go_enrichment_sim)
+
+# Visualization - Dotplot
+dp = dotplot(go_enrichment_sim, showCategory = 20, title = "edgeR clf vs WT down-regulated genes")
+
+# Visualization - Barplot
+bp = barplot(go_enrichment_sim, showCategory = 20, title = "edgeR clf vs WT down-regulated genes")
+
+# Visualization - category-gene-network plot
+np = cnetplot(go_enrichment_sim, showCategory = 5, title = "edgeR clf vs WT down-regulated genes")
+
+print(dp)
+print(bp)
+#print(np)
+  
+}
+
+```
+
+# DEseq2 \
+## `r test[1]` vs. `r test[2]` \
+```{r DESeq2, echo=F, include=FALSE}
+library(DESeq2)
+```
+```{r create DESeq2 object, echo=FALSE, include=FALSE}
+#Create a DESeqDataSet from count matrix and labels
+dds <- DESeqDataSetFromMatrix(countData = filtered_counts,
+                              colData = samples, design = ~ cond)
+dds <- DESeq(dds)
+```
+```{r DESeq2 test, echo=FALSE, include=FALSE}
+#Run the default analysis for DESeq2 and generate results table
+res <- results(dds, contrast = c("cond", test[1], test[2]),
+               lfcThreshold = 0,
+               altHypothesis = "greaterAbs",
+               alpha = FDR_threshold_deseq)
+
+#Sort by adjusted p-value and display
+resOrdered <- res[order(res$padj), ]
+```
+```{r counts per sample, include=FALSE}
+logcounts <- log2(counts(dds, normalized=TRUE) + 1)
+boxplot(logcounts, las=2, main="Log2 normalized counts per sample")
+```
+```{r distribution of gene expression, include=FALSE}
+plot(density(logcounts[,1]), main="Gene expression distributions", col=1)
+for (i in 2:ncol(logcounts)) {
+  lines(density(logcounts[,i]), col=i)
+}
+legend("topright", legend=colnames(logcounts), col=1:ncol(logcounts), lty=1)
+```
+```{r summary DEGs DESeq2, echo=FALSE}
+summary(resOrdered)
+```
+```{r annotate DEGs DESeq2, echo=FALSE, warning=FALSE, include=FALSE}
+## VISUALIZATION (VOLCANO PLOT + HEATMAP TOP DEGS)
+# Coerce to a data frame
+results_deseq <- as.data.frame(resOrdered)
+
+#add gene names
+results_deseq$Gene_ID <- rownames(results_deseq)
+results_deseq <- results_deseq %>% left_join(unique_annot)
+
+#reorder columns
+results_deseq <- results_deseq %>% relocate(where(is.numeric), .after = where(is.character))
+
+# Set a boolean column for significance
+results_deseq$significant <- ifelse(results_deseq$padj < .05, "Significant", NA)
+# add a column of NOs for differential expression
+results_deseq$diffexpressed <- "NO"
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+results_deseq$diffexpressed[results_deseq$log2FoldChange > lFC_threshold_deseq & results_deseq$significant == "Significant"] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+results_deseq$diffexpressed[results_deseq$log2FoldChange < -lFC_threshold_deseq & results_deseq$significant == "Significant"] <- "DOWN"
+```
+Top 20 Up-regulated genes:
+```{r top 20 UP genes DESeq2, echo=FALSE, results='asis'}
+up=results_deseq[results_deseq$diffexpressed == "UP",]
+kable(head(up[order(up$log2FoldChange, decreasing = TRUE),], 20))
+rm(up)
+```
+
+Top 20 Down-regulated genes:
+```{r top 20 DOWN genes DESeq2, echo=FALSE, results='asis'}
+down=results_deseq[results_deseq$diffexpressed == "DOWN",]
+kable(head(down[order(down$log2FoldChange),], 20))
+rm(down)
+```
+```{r save table, echo=FALSE, results='asis', include=FALSE}
+#write the complete table
+if (save.tables == T){
+  write.table(results_deseq, paste0(output_directory,"/deseq2_", test_name,".txt"), sep = "\t", quote = F, row.names = F)
+}
+```
+
+Volcano Plot \
+```{r volcano plot 1 DESeq2, echo=FALSE, warning=FALSE}
+#create a df for the plot data
+plot_data <- results_deseq
+
+# ceate a named vector: the values are the colors to be used, the names are the categories they will be assigned to:
+mycolors = c("blue", "red", "black")
+names(mycolors) = c("DOWN", "UP", "NO")
+
+# Create a new column "delabel" to results df; that will contain the name of genes differentially expressed (NA in case they are not)
+plot_data$delabel <- NA
+plot_data$delabel[plot_data$diffexpressed != "NO"] <- plot_data$Gene_ID[plot_data$diffexpressed != "NO"]
+```
+```{r volcano plot 2 DESeq2, echo=FALSE, warning=FALSE}
+# volcano plot
+ggplot(data=plot_data, aes(x=log2FoldChange, y=-log10(padj), col=diffexpressed, label=delabel)) +
+  geom_point() + 
+  theme_minimal() +
+  geom_text_repel(max.overlaps = 25) +
+  scale_color_manual(values=mycolors) +
+  geom_vline(xintercept=c(-lFC_threshold_edgeR, lFC_threshold_edgeR), col="red") +
+  geom_hline(yintercept=-log10(FDR_threshold_edgeR), col="red")
+```
+
+```{r ma plot, echo=FALSE, warning=FALSE}
+# MA plot
+#ggplot(data=plot_data,aes(x=logCPM,y=log2FoldChange, col=diffexpressed, label=delabel)) + 
+#  geom_point() +
+#  theme_minimal() +
+#  geom_text_repel(max.overlaps = 20) +
+#  scale_color_manual(values=mycolors)
+```
+
+### GO enrichment \
+#### `r test[1]` vs `r test[2]` up-regulated genes \
+```{r GO enrichment UP DESeq2, echo=FALSE, fig.height=8, fig.width=6}
+gene_list = as.vector(results_deseq[results_deseq$diffexpressed == "UP", "Gene_ID"])
+universe = as.vector(results_deseq$Gene_ID)
+
+# Perform GO enrichment analysis
+go_enrichment <- enrichGO(
+  gene = gene_list,
+  OrgDb = org.At.tair.db,
+  keyType = keyType,
+  ont = ont,    
+  pAdjustMethod = pAdjustMethod,
+  universe = universe,
+  pvalueCutoff = pvalueCutoff,
+  qvalueCutoff = qvalueCutoff,
+  readable = TRUE       # Convert gene IDs to gene names
+)
+
+if (is.null(go_enrichment) || nrow(as.data.frame(go_enrichment)) == 0) {
+  message("No enrichment results.")
+} else {
+  #calculate pairwise similarity between terms
+go_enrichment_sim = clusterProfiler::simplify(x = go_enrichment,
+                                              cutoff = simCutoff,
+                                              by = simBy,
+                                              select_fun = min,
+                                              measure = simMeasure,
+                                              semData = simSemData)
+#str(go_enrichment_sim)
+
+# Visualization - Dotplot
+dp = dotplot(go_enrichment_sim, showCategory = 20, title = paste0(test[1],"-",test[2]," up-regulated genes"))
+
+# Visualization - Barplot
+bp = barplot(go_enrichment_sim, showCategory = 20, title = paste0(test[1],"-",test[2]," up-regulated genes"))
+
+# Visualization - category-gene-network plot
+np = cnetplot(go_enrichment_sim, showCategory = 5, title = paste0(test[1],"-",test[2]," up-regulated genes"))
+
+print(dp)
+print(bp)
+#print(np)
+  
+}
+```
+\
+#### `r test[1]` vs `r test[2]` down-regulated genes \
+```{r GO enrichment DOWN DESeq2, echo=FALSE, fig.height=8, fig.width=6}
+gene_list = results_df[results_df$diffexpressed == "DOWN", "Gene_ID"]
+universe = results_df$Gene_ID
+
+# Perform GO enrichment analysis
+go_enrichment <- enrichGO(
+  gene = gene_list,
+  OrgDb = org.At.tair.db,
+  keyType = keyType,
+  ont = ont,    
+  pAdjustMethod = pAdjustMethod,
+  universe = universe,
+  pvalueCutoff = pvalueCutoff,
+  qvalueCutoff = qvalueCutoff,
+  readable = FALSE       # Convert gene IDs to gene names
+)
+
+if (is.null(go_enrichment) || nrow(as.data.frame(go_enrichment)) == 0) {
+  message("No enrichment results to simplify.")
+} else {
+  #str(go_enrichment)
+
+#calculate pairwise similarity between terms
+go_enrichment_sim = clusterProfiler::simplify(x = go_enrichment,
+                                              cutoff = simCutoff,
+                                              by = simBy,
+                                              select_fun = min,
+                                              measure = simMeasure,
+                                              semData = simSemData)
+#str(go_enrichment_sim)
+
+# Visualization - Dotplot
+dp = dotplot(go_enrichment_sim, showCategory = 20, title = paste0(test[1],"-",test[2]," down-regulated genes"))
+
+# Visualization - Barplot
+bp = barplot(go_enrichment_sim, showCategory = 20, title = paste0(test[1],"-",test[2]," down-regulated genes"))
+
+# Visualization - category-gene-network plot
+np = cnetplot(go_enrichment_sim, showCategory = 5, title = paste0(test[1],"-",test[2]," down-regulated genes"))
+
+print(dp)
+print(bp)
+#print(np)
+  
+}
+
+```
