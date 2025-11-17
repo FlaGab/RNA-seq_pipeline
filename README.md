@@ -2,12 +2,12 @@
 A standard pipeline for RNA-seq analysis
 
 requisites:
-fastQC
-multiQC (optional)
-trimmomatic
-STAR
-subread
-samtools
+-fastQC
+-multiQC (optional)
+-trimmomatic
+-STAR
+-subread
+-samtools
 
 General usage:
 1) First, fill the settings.txt file with your parameters.
